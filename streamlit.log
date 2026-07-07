@@ -1,7 +1,7 @@
 
 Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.
 
-2026-07-07 05:07:55.693 Uvicorn server started on :::8501
+2026-07-07 06:09:05.174 Uvicorn server started on :::8501
 
   You can now view your Streamlit app in your browser.
 
@@ -9,5 +9,3 @@ Collecting usage statistics. To deactivate, set browser.gatherUsageStats to fals
   Network URL: http://172.28.0.12:8501
   External URL: http://34.81.100.11:8501
 
-/content/app.py:6: DeprecationWarning: `langchain-community` is being sunset and is no longer actively maintained. See https://github.com/langchain-ai/langchain-community/issues/674 for details and migration guidance toward standalone integration packages.
-  from langchain_community.document_loaders import PyPDFLoader
