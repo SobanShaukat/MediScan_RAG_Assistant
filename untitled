@@ -1,0 +1,205 @@
+import os
+import tempfile
+import streamlit as st
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# -----------------------------
+# Page config
+# -----------------------------
+st.set_page_config(page_title="MediScan RAG Assistant", page_icon="🩺", layout="wide")
+st.title("🩺 MediScan RAG Assistant")
+st.caption("Upload a medical PDF and ask grounded questions with page citations.")
+
+
+# -----------------------------
+# Prompt
+# -----------------------------
+RAG_PROMPT = ChatPromptTemplate.from_template("""
+You are MediScan, a medical document assistant.
+
+Rules:
+1) Answer ONLY from the provided context.
+2) If answer is not in context, say exactly: "I don't know based on the provided document."
+3) Be concise, factual, and avoid speculation.
+4) Do not provide medical advice; only summarize document content.
+5) At the end, provide citations as: Sources: p.X, p.Y
+
+Question:
+{question}
+
+Context:
+{context}
+""")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def format_context(docs):
+    blocks = []
+    for d in docs:
+        p = d.metadata.get("page_number", "?")
+        txt = d.page_content.strip().replace("\n", " ")
+        blocks.append(f"[Page {p}] {txt}")
+    return "\n\n".join(blocks)
+
+
+def format_citations(docs):
+    pages = sorted(set(d.metadata.get("page_number", "?") for d in docs))
+    return ", ".join([f"p.{p}" for p in pages])
+
+
+def build_vectorstore_from_pdf(uploaded_file):
+    # Save uploaded PDF to a temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
+
+    # Load PDF
+    loader = PyPDFLoader(tmp_path)
+    docs = loader.load()
+
+    # Add metadata
+    for i, d in enumerate(docs):
+        page_index = d.metadata.get("page", i)
+        d.metadata["page_number"] = int(page_index) + 1
+        d.metadata["source_file"] = uploaded_file.name
+
+    # Chunking
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=900,
+        chunk_overlap=180,
+        separators=["\n\n", "\n", ". ", "; ", ", ", " "],
+        length_function=len,
+    )
+    chunked_docs = splitter.split_documents(docs)
+
+    for idx, d in enumerate(chunked_docs):
+        d.metadata["chunk_id"] = idx
+        d.metadata["char_count"] = len(d.page_content)
+
+    # Embeddings
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+    # Chroma (in temp dir)
+    persist_dir = tempfile.mkdtemp(prefix="chroma_mediscan_")
+    vectorstore = Chroma.from_documents(
+        documents=chunked_docs,
+        embedding=embedding_model,
+        collection_name="mediscan_collection",
+        persist_directory=persist_dir
+    )
+
+    return vectorstore, len(docs), len(chunked_docs)
+
+
+def ask_mediscan(question, retriever, llm):
+    retrieved_docs = retriever.invoke(question)
+    context = format_context(retrieved_docs)
+    citations = format_citations(retrieved_docs)
+
+    messages = RAG_PROMPT.format_messages(question=question, context=context)
+    response = llm.invoke(messages).content.strip()
+
+    if "Sources:" not in response:
+        response = f"{response}\n\nSources: {citations}"
+
+    return response, citations, retrieved_docs
+
+
+# -----------------------------
+# Sidebar settings
+# -----------------------------
+st.sidebar.header("⚙️ Settings")
+api_key = st.sidebar.text_input("GROQ_API_KEY", type="password", help="Get free key from https://console.groq.com/keys")
+model_name = st.sidebar.selectbox("Groq Model", ["llama-3.1-8b-instant", "llama-3.1-70b-versatile"], index=0)
+top_k = st.sidebar.slider("Top-k retrieved chunks", min_value=2, max_value=8, value=4, step=1)
+
+uploaded_pdf = st.file_uploader("📄 Upload Medical PDF", type=["pdf"])
+
+
+# -----------------------------
+# Session state
+# -----------------------------
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "ready" not in st.session_state:
+    st.session_state.ready = False
+
+
+# -----------------------------
+# Build index on upload
+# -----------------------------
+if uploaded_pdf is not None:
+    if st.button("Process PDF"):
+        with st.spinner("Processing PDF, chunking, and indexing..."):
+            vs, page_count, chunk_count = build_vectorstore_from_pdf(uploaded_pdf)
+
+            retriever = vs.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": top_k, "fetch_k": 12, "lambda_mult": 0.5}
+            )
+
+            st.session_state.vectorstore = vs
+            st.session_state.retriever = retriever
+            st.session_state.ready = True
+            st.session_state.chat_history = []
+
+        st.success(f"✅ Ready! Pages: {page_count}, Chunks: {chunk_count}")
+
+
+# -----------------------------
+# Q&A area
+# -----------------------------
+if st.session_state.ready:
+    if not api_key:
+        st.warning("Enter GROQ_API_KEY in sidebar to start Q&A.")
+    else:
+        llm = ChatGroq(
+            model=model_name,
+            api_key=api_key,
+            temperature=0
+        )
+
+        question = st.text_input("Ask a question from the uploaded document:")
+        if st.button("Ask") and question.strip():
+            with st.spinner("Thinking..."):
+                answer, citations, retrieved_docs = ask_mediscan(
+                    question, st.session_state.retriever, llm
+                )
+
+                st.session_state.chat_history.append({
+                    "q": question,
+                    "a": answer,
+                    "c": citations,
+                    "docs": retrieved_docs
+                })
+
+        # Render chat
+        for i, item in enumerate(reversed(st.session_state.chat_history), start=1):
+            st.markdown(f"### ❓ Q{i}: {item['q']}")
+            st.markdown(f"**Answer:**\n\n{item['a']}")
+            with st.expander("Show retrieved evidence snippets"):
+                for j, d in enumerate(item["docs"], start=1):
+                    st.markdown(
+                        f"**{j}. Page {d.metadata.get('page_number')} | Chunk {d.metadata.get('chunk_id')}**"
+                    )
+                    st.write(d.page_content[:700] + ("..." if len(d.page_content) > 700 else ""))
+            st.markdown("---")
+else:
+    st.info("Upload a PDF and click **Process PDF** to begin.")
